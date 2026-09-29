@@ -31,23 +31,28 @@ int llOpenTx(LinkLayer llParameters)
     printf("Serial port %s opened\n", llParameters.serialPort);
 
     // Create string to send
-    unsigned char buf[BUF_SIZE] = {0};
-
-    for (int i = 0; i < BUF_SIZE; i++)
-    {
-        buf[i] = 'a' + i % 26;
-    }
+    unsigned char set[5] = {0x7E, 0x03, 0x03, 0x03 ^0x07, 0x7E};
 
     // In non-canonical mode, '\n' does not end the writing.
     // Test this condition by placing a '\n' in the middle of the buffer.
     // The whole buffer must be sent even with the '\n'.
-    buf[5] = '\n';
 
-    int bytes = writeBytesSerialPort(buf, BUF_SIZE);
+    int bytes = writeBytesSerialPort(set, 5);
     printf("%d bytes written to serial port\n", bytes);
 
     // Wait until all bytes have been written to the serial port
-    sleep(1);
+    unsigned char byte;
+    int flags = 0;
+    while (flags < 2)
+    {
+        if(readByteSerialPort(&byte) <= 0) continue;
+        printf("Byte received: 0x%02X\n", byte);
+        if (byte == 0x7E) flags++;
+    }
+
+    printf("UA received\n");
+    
+    
 
     // Close serial port
     if (closeSerialPort() < 0)
@@ -82,28 +87,36 @@ int llOpenRx(LinkLayer llParameters)
     // It must be changed in order to respect the specifications of the protocol indicated in the Lab guide.
 
     // TODO: Save the received bytes in a buffer array and print it at the end of the program.
-    volatile int STOP = FALSE;
-    int nBytesBuf = 0;
 
-    while (STOP == FALSE)
+    unsigned char byte;
+    int flags = 0;
+    while (flags < 2)
     {
-        // Read one byte from serial port.
-        // NOTE: You must check how many bytes were actually read by reading the return value.
-        // In this example, we assume that the byte is always read, which may not be true.
-        unsigned char byte;
-        int bytes = readByteSerialPort(&byte);
-        nBytesBuf += bytes;
-
-        printf("Byte received: %c\n", byte);
-
-        if (byte == 'z')
-        {
-            printf("Received 'z' char. Stop reading from serial port.\n");
-            STOP = TRUE;
-        }
+        if(readByteSerialPort(&byte) <= 0) continue;
+        printf("Byte received: 0x%02X\n", byte);
+        if (byte == 0x7E) flags++;
     }
 
-    printf("Total bytes received: %d\n", nBytesBuf);
+    printf("SET received\n");
+
+    unsigned char ua[5] = {0x7E, 0x01, 0x07, 0x01 ^ 0x07, 0x7E};
+
+    int rx_send_bytes = writeBytesSerialPort(ua, 5);
+    printf("%d bytes written to serial port\n", rx_send_bytes);
+
+    // Wait until all bytes have been written to the serial port
+    sleep(1);
+
+    // Close serial port
+    if (closeSerialPort() < 0)
+    {
+        perror("closeSerialPort");
+        return -1;
+    }
+
+    printf("Serial port %s closed\n", llParameters.serialPort);
+
+    return 0;
 
     // Close serial port
     if (closeSerialPort() < 0)
