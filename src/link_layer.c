@@ -7,6 +7,7 @@
 
 #include <signal.h>
 #include <stdio.h>
+#include <string.h>
 #include <unistd.h>
 
 // MISC
@@ -15,17 +16,26 @@
 
 // Frame fields
 #define FLAG  0x7E
+#define ESC   0x7D // escape octet used in byte stuffing
 #define A_TX  0x03 // frames sent by the Sender or answers from the Receiver
 #define A_RX  0x01 // frames sent by the Receiver or answers from the Sender
 #define C_SET 0x03
 #define C_UA  0x07
+#define C_I(n)   ((n) << 7)   // I frame number n:  0x00 / 0x80
+#define C_RR(n)  (0xAA | (n)) // RR,  ready for n:  0xAA / 0xAB
+#define C_REJ(n) (0x54 | (n)) // REJ, rejected n:   0x54 / 0x55
 
-// Return values of readSupervisionFrame
+// Data field of an I frame (after destuffing): packet + BCC2
+#define MAX_DATA_FIELD (MAX_PAYLOAD_SIZE + 1)
+// Worst case I frame: every byte of the data field is stuffed (doubled)
+#define MAX_I_FRAME (4 + 2 * MAX_DATA_FIELD + 1)
+
+// Return values of readFrame / readSupervisionFrame
 #define FRAME_OK       0
 #define FRAME_ERROR   -1
 #define FRAME_TIMEOUT -2
 
-// States of the supervision frame state machine
+// States of the frame reception state machine
 typedef enum
 {
     START,
@@ -33,8 +43,18 @@ typedef enum
     A_RCV,
     C_RCV,
     BCC_OK,
+    DATA_RCV, // reading the data field of an I frame
+    ESC_RCV,  // previous byte of the data field was ESC
     STOP_ST
 } State;
+
+// Parameters saved in llOpen, used by the other functions
+static LinkLayer connectionParameters;
+
+// Transmitter: N(s) of the next I frame to send
+static int ns = 0;
+// Receiver: N(s) of the next I frame expected
+static int nr = 0;
 
 ////////////////////////////////////////////////
 // ALARM
@@ -57,15 +77,22 @@ void alarmHandler(int signal)
 ////////////////////////////////////////////////
 // STATE MACHINE
 ////////////////////////////////////////////////
-// Reads bytes from the serial port until a valid supervision frame
-// [FLAG, a, c, a^c, FLAG] is received.
+// Reads bytes from the serial port until a valid frame with address a is received:
+//   - supervision/unnumbered frame [FLAG, a, c, a^c, FLAG]
+//   - I frame [FLAG, a, c, a^c, D1..DN, BCC2, FLAG] (only if data != NULL)
+// The control field received is saved in *c. For I frames the destuffed data
+// field (D1..DN followed by BCC2, not yet checked) is saved in data and its
+// size in *dataSize. For supervision frames *dataSize is 0.
+// Frames with a wrong header (BCC1) are ignored, as the protocol says.
 // If useAlarm is TRUE, it gives up when the alarm is triggered.
 // Returns FRAME_OK on success, FRAME_TIMEOUT if the alarm was triggered,
 // FRAME_ERROR on serial port error.
-static int readSupervisionFrame(unsigned char a, unsigned char c, int useAlarm)
+static int readFrame(unsigned char a, unsigned char *c, unsigned char *data,
+                     int *dataSize, int useAlarm)
 {
     State state = START;
     unsigned char byte;
+    int size = 0;
 
     while (state != STOP_ST)
     {
@@ -83,8 +110,6 @@ static int readSupervisionFrame(unsigned char a, unsigned char c, int useAlarm)
         if (r == 0)
             continue; // nothing read
 
-        printf("Byte received: 0x%02X\n", byte);
-
         switch (state)
         {
         case START:
@@ -100,26 +125,62 @@ static int readSupervisionFrame(unsigned char a, unsigned char c, int useAlarm)
             break;
 
         case A_RCV:
-            if (byte == c)
-                state = C_RCV;
-            else if (byte == FLAG)
+            if (byte == FLAG)
                 state = FLAG_RCV;
             else
-                state = START;
+            {
+                // Any control field is accepted here, the caller checks it
+                *c = byte;
+                state = C_RCV;
+            }
             break;
 
         case C_RCV:
-            if (byte == (a ^ c))
+            if (byte == (a ^ *c))
                 state = BCC_OK;
             else if (byte == FLAG)
                 state = FLAG_RCV;
             else
-                state = START;
+                state = START; // header error: frame ignored
             break;
 
         case BCC_OK:
             if (byte == FLAG)
-                state = STOP_ST;
+                state = STOP_ST; // supervision frame (no data field)
+            else if (data == NULL)
+                state = START; // not expecting I frames
+            else
+            {
+                size = 0;
+                state = DATA_RCV;
+                // Process this byte as the first one of the data field
+                if (byte == ESC)
+                    state = ESC_RCV;
+                else
+                    data[size++] = byte;
+            }
+            break;
+
+        case DATA_RCV:
+            if (byte == FLAG)
+                state = STOP_ST; // end of the I frame
+            else if (byte == ESC)
+                state = ESC_RCV;
+            else if (size < MAX_DATA_FIELD)
+                data[size++] = byte;
+            else
+                state = START; // frame too long: discard it
+            break;
+
+        case ESC_RCV:
+            // Destuffing: 0x7D 0x5E -> 0x7E and 0x7D 0x5D -> 0x7D
+            if (byte == FLAG)
+                state = FLAG_RCV; // invalid escape sequence: new frame starts
+            else if (size < MAX_DATA_FIELD)
+            {
+                data[size++] = byte ^ 0x20;
+                state = DATA_RCV;
+            }
             else
                 state = START;
             break;
@@ -129,7 +190,50 @@ static int readSupervisionFrame(unsigned char a, unsigned char c, int useAlarm)
         }
     }
 
+    if (dataSize != NULL)
+        *dataSize = size;
+
     return FRAME_OK;
+}
+
+// Reads frames until a valid supervision frame [FLAG, a, c, a^c, FLAG]
+// with the given control field is received. Other frames are ignored.
+// Same return values as readFrame.
+static int readSupervisionFrame(unsigned char a, unsigned char c, int useAlarm)
+{
+    unsigned char cRcv;
+    int res;
+
+    do
+    {
+        res = readFrame(a, &cRcv, NULL, NULL, useAlarm);
+    } while (res == FRAME_OK && cRcv != c);
+
+    return res;
+}
+
+// Sends the supervision frame [FLAG, a, c, a^c, FLAG].
+// Returns the number of bytes written or -1 on error.
+static int sendSupervisionFrame(unsigned char a, unsigned char c)
+{
+    unsigned char frame[5] = {FLAG, a, c, a ^ c, FLAG};
+    return writeBytesSerialPort(frame, 5);
+}
+
+// Byte stuffing: writes byte in frame[pos], replacing FLAG and ESC
+// by the escape sequences 0x7D 0x5E and 0x7D 0x5D.
+// Returns the position after the written bytes.
+static int stuffByte(unsigned char *frame, int pos, unsigned char byte)
+{
+    if (byte == FLAG || byte == ESC)
+    {
+        frame[pos++] = ESC;
+        frame[pos++] = byte ^ 0x20;
+    }
+    else
+        frame[pos++] = byte;
+
+    return pos;
 }
 
 ////////////////////////////////////////////////
@@ -149,6 +253,8 @@ int llOpenTx(LinkLayer llParameters)
     }
 
     printf("Serial port %s opened\n", llParameters.serialPort);
+    connectionParameters = llParameters;
+    ns = 0;
 
     // Install the function signal to be automatically invoked when the timer
     // expires, invoking in its turn the user function alarmHandler
@@ -222,6 +328,8 @@ int llOpenRx(LinkLayer llParameters)
     }
 
     printf("Serial port %s opened\n", llParameters.serialPort);
+    connectionParameters = llParameters;
+    nr = 0;
 
     // Read from serial port until a valid SET frame is received.
 
@@ -253,9 +361,77 @@ int llOpenRx(LinkLayer llParameters)
 ////////////////////////////////////////////////
 int llSend(const unsigned char *buf, int bufSize)
 {
-    // TODO: Implement this function
+    if (buf == NULL || bufSize < 0 || bufSize > MAX_PAYLOAD_SIZE)
+        return -1;
 
-    return 0;
+    // Build the I frame [FLAG, A, C, BCC1, D1..DN, BCC2, FLAG]
+    // A, C and BCC1 never need stuffing (0x03, 0x00/0x80, 0x03/0x83)
+    unsigned char frame[MAX_I_FRAME];
+    int frameSize = 0;
+
+    frame[frameSize++] = FLAG;
+    frame[frameSize++] = A_TX;
+    frame[frameSize++] = C_I(ns);
+    frame[frameSize++] = A_TX ^ C_I(ns);
+
+    // BCC2 is computed over the original bytes (before stuffing)
+    unsigned char bcc2 = 0;
+    for (int i = 0; i < bufSize; i++)
+    {
+        bcc2 ^= buf[i];
+        frameSize = stuffByte(frame, frameSize, buf[i]);
+    }
+    frameSize = stuffByte(frame, frameSize, bcc2);
+
+    frame[frameSize++] = FLAG;
+
+    // Stop & Wait: 1 first transmission + up to nRetransmissions retransmissions
+    for (int attempt = 0; attempt <= connectionParameters.nRetransmissions; attempt++)
+    {
+        if (writeBytesSerialPort(frame, frameSize) != frameSize)
+        {
+            printf("Error writing I frame\n");
+            return -1;
+        }
+        printf("I(%d) sent (%d bytes), attempt #%d\n", ns, frameSize, attempt + 1);
+
+        // Enable alarm in t seconds
+        alarmEnabled = TRUE;
+        alarm(connectionParameters.timeout);
+
+        // Wait for RR(ns+1) or REJ(ns). Any other frame (e.g. an old RR) is ignored.
+        unsigned char c;
+        int res;
+        do
+        {
+            res = readFrame(A_TX, &c, NULL, NULL, TRUE);
+        } while (res == FRAME_OK && c != C_RR(ns ^ 1) && c != C_REJ(ns));
+
+        // Disable pending alarms, if any
+        alarm(0);
+
+        if (res == FRAME_ERROR)
+        {
+            printf("Error reading answer to I(%d)\n", ns);
+            return -1;
+        }
+
+        if (res == FRAME_OK && c == C_RR(ns ^ 1))
+        {
+            printf("RR(%d) received\n", ns ^ 1);
+            ns ^= 1;
+            return bufSize;
+        }
+
+        // REJ or timeout: the loop retransmits the I frame
+        if (res == FRAME_OK)
+            printf("REJ(%d) received\n", ns);
+        else
+            printf("Timeout, no answer to I(%d)\n", ns);
+    }
+
+    printf("Maximum number of retransmissions reached. Giving up.\n");
+    return -1;
 }
 
 ////////////////////////////////////////////////
@@ -263,9 +439,64 @@ int llSend(const unsigned char *buf, int bufSize)
 ////////////////////////////////////////////////
 int llReceive(unsigned char *packet)
 {
-    // TODO: Implement this function
+    unsigned char data[MAX_DATA_FIELD];
 
-    return 0;
+    while (TRUE)
+    {
+        unsigned char c;
+        int dataSize;
+
+        // The receiver does not use the alarm: it waits until a frame arrives
+        if (readFrame(A_TX, &c, data, &dataSize, FALSE) != FRAME_OK)
+        {
+            printf("Error reading I frame\n");
+            return -1;
+        }
+
+        // The UA sent in llOpenRx was lost and the transmitter sent SET again
+        if (c == C_SET)
+        {
+            printf("SET received again, resending UA\n");
+            sendSupervisionFrame(A_TX, C_UA);
+            continue;
+        }
+
+        if (c != C_I(0) && c != C_I(1))
+            continue; // not an I frame: ignored
+
+        int frameNs = (c == C_I(1));
+
+        // Duplicate (our RR was lost): data discarded, confirmed with RR
+        if (frameNs != nr)
+        {
+            printf("Duplicate I(%d) received, sending RR(%d)\n", frameNs, nr);
+            sendSupervisionFrame(A_TX, C_RR(nr));
+            continue;
+        }
+
+        // Check BCC2 (last byte of the data field) against the data received
+        unsigned char bcc2 = 0;
+        for (int i = 0; i < dataSize - 1; i++)
+            bcc2 ^= data[i];
+
+        if (dataSize < 1 || bcc2 != data[dataSize - 1])
+        {
+            // New frame with an error in the data field: ask for retransmission
+            printf("BCC2 error in I(%d), sending REJ(%d)\n", frameNs, nr);
+            sendSupervisionFrame(A_TX, C_REJ(nr));
+            continue;
+        }
+
+        // New frame without errors: accepted and passed to the application
+        int packetSize = dataSize - 1;
+        memcpy(packet, data, packetSize);
+
+        nr ^= 1;
+        sendSupervisionFrame(A_TX, C_RR(nr));
+        printf("I(%d) received (%d bytes), sending RR(%d)\n", frameNs, packetSize, nr);
+
+        return packetSize;
+    }
 }
 
 ////////////////////////////////////////////////
