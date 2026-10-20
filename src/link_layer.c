@@ -461,7 +461,7 @@ int llReceive(unsigned char *packet)
             continue;
         }
 
-        if (c != C_I(0) && c != C_I(1))
+        if (c != C_I(0) && c != C_I(1)) 
             continue; // not an I frame: ignored
 
         int frameNs = (c == C_I(1));
