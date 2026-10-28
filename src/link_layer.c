@@ -21,6 +21,7 @@
 #define A_RX  0x01 // frames sent by the Receiver or answers from the Sender
 #define C_SET 0x03
 #define C_UA  0x07
+#define C_DISC 0x0B
 #define C_I(n)   ((n) << 7)   // I frame number n:  0x00 / 0x80
 #define C_RR(n)  (0xAA | (n)) // RR,  ready for n:  0xAA / 0xAB
 #define C_REJ(n) (0x54 | (n)) // REJ, rejected n:   0x54 / 0x55
@@ -55,6 +56,20 @@ static LinkLayer connectionParameters;
 static int ns = 0;
 // Receiver: N(s) of the next I frame expected
 static int nr = 0;
+// Receiver: TRUE if the DISC of the transmitter was already received in llReceive
+static int discReceived = FALSE;
+
+// Protocol statistics, printed in llClose
+static struct
+{
+    int iFramesSent;     // Tx: I frames written (including retransmissions)
+    int retransmissions; // Tx: I frames written again (after timeout or REJ)
+    int timeouts;        // Tx: timeouts waiting for RR/REJ
+    int rejReceived;     // Tx: REJ frames received
+    int iFramesAccepted; // Rx: new I frames passed to the application
+    int duplicates;      // Rx: duplicate I frames received
+    int rejSent;         // Rx: REJ frames sent (BCC2 errors)
+} stats;
 
 ////////////////////////////////////////////////
 // ALARM
@@ -72,6 +87,22 @@ void alarmHandler(int signal)
     alarmCount++;
 
     printf("Alarm #%d received\n", alarmCount);
+}
+
+// Install the function signal to be automatically invoked when the timer
+// expires, invoking in its turn the user function alarmHandler
+static int installAlarm()
+{
+    struct sigaction act = {0};
+    act.sa_handler = &alarmHandler;
+    if (sigaction(SIGALRM, &act, NULL) == -1)
+    {
+        perror("sigaction");
+        return -1;
+    }
+
+    printf("Alarm configured\n");
+    return 0;
 }
 
 ////////////////////////////////////////////////
@@ -255,18 +286,10 @@ int llOpenTx(LinkLayer llParameters)
     printf("Serial port %s opened\n", llParameters.serialPort);
     connectionParameters = llParameters;
     ns = 0;
+    memset(&stats, 0, sizeof(stats));
 
-    // Install the function signal to be automatically invoked when the timer
-    // expires, invoking in its turn the user function alarmHandler
-    struct sigaction act = {0};
-    act.sa_handler = &alarmHandler;
-    if (sigaction(SIGALRM, &act, NULL) == -1)
-    {
-        perror("sigaction");
+    if (installAlarm() < 0)
         return -1;
-    }
-
-    printf("Alarm configured\n");
 
     // Create string to send
     unsigned char set[5] = {FLAG, A_TX, C_SET, A_TX ^ C_SET, FLAG}; // BCC = 0x00
@@ -311,6 +334,7 @@ int llOpenTx(LinkLayer llParameters)
     }
 
     printf("Maximum number of retransmissions reached. Giving up.\n");
+    closeSerialPort();
     return -1;
 }
 
@@ -330,6 +354,12 @@ int llOpenRx(LinkLayer llParameters)
     printf("Serial port %s opened\n", llParameters.serialPort);
     connectionParameters = llParameters;
     nr = 0;
+    discReceived = FALSE;
+    memset(&stats, 0, sizeof(stats));
+
+    // The receiver also needs the alarm: its DISC is protected by a timer
+    if (installAlarm() < 0)
+        return -1;
 
     // Read from serial port until a valid SET frame is received.
 
@@ -386,14 +416,22 @@ int llSend(const unsigned char *buf, int bufSize)
     frame[frameSize++] = FLAG;
 
     // Stop & Wait: 1 first transmission + up to nRetransmissions retransmissions
-    for (int attempt = 0; attempt <= connectionParameters.nRetransmissions; attempt++)
+    // after a timeout. A REJ also causes a retransmission, but it does not count
+    // for the limit: it proves the receiver is still answering.
+    int timeouts = 0;
+    int sentThisFrame = FALSE;
+    while (timeouts <= connectionParameters.nRetransmissions)
     {
         if (writeBytesSerialPort(frame, frameSize) != frameSize)
         {
             printf("Error writing I frame\n");
             return -1;
         }
-        printf("I(%d) sent (%d bytes), attempt #%d\n", ns, frameSize, attempt + 1);
+        printf("I(%d) sent (%d bytes), timeouts so far: %d\n", ns, frameSize, timeouts);
+        stats.iFramesSent++;
+        if (sentThisFrame)
+            stats.retransmissions++;
+        sentThisFrame = TRUE;
 
         // Enable alarm in t seconds
         alarmEnabled = TRUE;
@@ -425,9 +463,16 @@ int llSend(const unsigned char *buf, int bufSize)
 
         // REJ or timeout: the loop retransmits the I frame
         if (res == FRAME_OK)
+        {
             printf("REJ(%d) received\n", ns);
+            stats.rejReceived++;
+        }
         else
+        {
             printf("Timeout, no answer to I(%d)\n", ns);
+            timeouts++;
+            stats.timeouts++;
+        }
     }
 
     printf("Maximum number of retransmissions reached. Giving up.\n");
@@ -461,7 +506,15 @@ int llReceive(unsigned char *packet)
             continue;
         }
 
-        if (c != C_I(0) && c != C_I(1)) 
+        // The transmitter closed the connection (e.g. it gave up): llCloseRx answers it
+        if (c == C_DISC)
+        {
+            printf("DISC received while waiting for an I frame\n");
+            discReceived = TRUE;
+            return -1;
+        }
+
+        if (c != C_I(0) && c != C_I(1))
             continue; // not an I frame: ignored
 
         int frameNs = (c == C_I(1));
@@ -471,6 +524,7 @@ int llReceive(unsigned char *packet)
         {
             printf("Duplicate I(%d) received, sending RR(%d)\n", frameNs, nr);
             sendSupervisionFrame(A_TX, C_RR(nr));
+            stats.duplicates++;
             continue;
         }
 
@@ -484,6 +538,7 @@ int llReceive(unsigned char *packet)
             // New frame with an error in the data field: ask for retransmission
             printf("BCC2 error in I(%d), sending REJ(%d)\n", frameNs, nr);
             sendSupervisionFrame(A_TX, C_REJ(nr));
+            stats.rejSent++;
             continue;
         }
 
@@ -493,6 +548,7 @@ int llReceive(unsigned char *packet)
 
         nr ^= 1;
         sendSupervisionFrame(A_TX, C_RR(nr));
+        stats.iFramesAccepted++;
         printf("I(%d) received (%d bytes), sending RR(%d)\n", frameNs, packetSize, nr);
 
         return packetSize;
@@ -502,14 +558,63 @@ int llReceive(unsigned char *packet)
 ////////////////////////////////////////////////
 // LLCLOSE
 ////////////////////////////////////////////////
-int llCloseTx()
+// Sends the command frame (a, c) and waits for the answer (answerA, answerC),
+// retransmitting the command after each timeout, up to nRetransmissions times.
+// Returns 0 when the answer is received, -1 otherwise.
+static int sendCommand(unsigned char a, unsigned char c,
+                       unsigned char answerA, unsigned char answerC, const char *name)
 {
-    // TODO: Implement this function (DISC / DISC / UA exchange)
+    alarmCount = 0;
+    while (alarmCount <= connectionParameters.nRetransmissions)
+    {
+        sendSupervisionFrame(a, c);
+        printf("%s sent, attempt #%d\n", name, alarmCount + 1);
 
-    // Wait until all bytes have been written to the serial port
+        // Enable alarm in t seconds
+        alarmEnabled = TRUE;
+        alarm(connectionParameters.timeout);
+
+        int res = readSupervisionFrame(answerA, answerC, TRUE);
+
+        // Disable pending alarms, if any
+        alarm(0);
+
+        if (res == FRAME_OK)
+            return 0;
+        if (res == FRAME_ERROR)
+            return -1;
+
+        printf("Timeout, no answer to %s\n", name);
+    }
+
+    printf("Maximum number of retransmissions reached. Giving up.\n");
+    return -1;
+}
+
+static void printStatistics(int isTx)
+{
+    printf("\n---- Statistics ----\n");
+    if (isTx)
+    {
+        printf("I frames sent:      %d\n", stats.iFramesSent);
+        printf("Retransmissions:    %d\n", stats.retransmissions);
+        printf("Timeouts:           %d\n", stats.timeouts);
+        printf("REJ received:       %d\n", stats.rejReceived);
+    }
+    else
+    {
+        printf("I frames accepted:  %d\n", stats.iFramesAccepted);
+        printf("Duplicates:         %d\n", stats.duplicates);
+        printf("REJ sent:           %d\n", stats.rejSent);
+    }
+    printf("--------------------\n\n");
+}
+
+// Wait until all bytes have been written and close the serial port
+static int closeConnection()
+{
     sleep(1);
 
-    // Close serial port
     if (closeSerialPort() < 0)
     {
         perror("closeSerialPort");
@@ -517,25 +622,72 @@ int llCloseTx()
     }
 
     printf("Serial port closed\n");
-
     return 0;
+}
+
+int llCloseTx()
+{
+    // Tx -> DISC (A = 0x03, command sent by the Transmitter)
+    // Rx -> DISC (A = 0x01, command sent by the Receiver)
+    int res = sendCommand(A_TX, C_DISC, A_RX, C_DISC, "DISC");
+
+    if (res == 0)
+    {
+        printf("DISC received\n");
+
+        // Tx -> UA (A = 0x01, answer sent by the Transmitter)
+        sendSupervisionFrame(A_RX, C_UA);
+        printf("UA sent\n");
+    }
+
+    printStatistics(TRUE);
+
+    if (closeConnection() < 0)
+        return -1;
+
+    return res;
 }
 
 int llCloseRx()
 {
-    // TODO: Implement this function (DISC / DISC / UA exchange)
-
-    // Wait until all bytes have been written to the serial port
-    sleep(1);
-
-    // Close serial port
-    if (closeSerialPort() < 0)
+    // Wait for the DISC of the transmitter (unless llReceive already got it).
+    // Meanwhile, the last I frame may arrive again because our RR was lost:
+    // it is a duplicate and must be confirmed with RR.
+    unsigned char data[MAX_DATA_FIELD];
+    while (!discReceived)
     {
-        perror("closeSerialPort");
-        return -1;
+        unsigned char c;
+        int dataSize;
+
+        if (readFrame(A_TX, &c, data, &dataSize, FALSE) != FRAME_OK)
+        {
+            printf("Error reading DISC\n");
+            closeConnection();
+            return -1;
+        }
+
+        if (c == C_DISC)
+            discReceived = TRUE;
+        else if (c == C_I(0) || c == C_I(1))
+        {
+            printf("Duplicate I(%d) received, sending RR(%d)\n", c == C_I(1), nr);
+            sendSupervisionFrame(A_TX, C_RR(nr));
+            stats.duplicates++;
+        }
     }
 
-    printf("Serial port closed\n");
+    printf("DISC received\n");
 
-    return 0;
+    // Rx -> DISC (A = 0x01), protected by a timer; waits for the UA (A = 0x01)
+    int res = sendCommand(A_RX, C_DISC, A_RX, C_UA, "DISC");
+
+    if (res == 0)
+        printf("UA received\n");
+
+    printStatistics(FALSE);
+
+    if (closeConnection() < 0)
+        return -1;
+
+    return res;
 }
