@@ -23,8 +23,8 @@
 #include <time.h>
 #include <unistd.h>
 
-#define TXDEV "/tmp/ttyS10"
-#define RXDEV "/tmp/ttyS11"
+#define TXDEV "/dev/ttyS0"
+#define RXDEV "/dev/ttyUSB0"
 #define TX_EMULATOR "/tmp/emulatorTx"
 #define RX_EMULATOR "/tmp/emulatorRx"
 
