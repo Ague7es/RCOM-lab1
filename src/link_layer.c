@@ -10,10 +10,6 @@
 #include <string.h>
 #include <unistd.h>
 
-// MISC
-#define _POSIX_SOURCE 1 // POSIX compliant source
-#define BUF_SIZE 256
-
 // Frame fields
 #define FLAG  0x7E
 #define ESC   0x7D // escape octet used in byte stuffing
@@ -78,19 +74,16 @@ static struct
 volatile int alarmEnabled = FALSE;
 volatile int alarmCount = 0;
 
-// User-defined function to handle alarms (handler function)
-// This function will be called when the alarm is triggered
+// Called when the alarm is triggered
 void alarmHandler(int signal)
 {
-    // Can be used to change a flag that increases the number of alarms
     alarmEnabled = FALSE;
     alarmCount++;
 
     printf("Alarm #%d received\n", alarmCount);
 }
 
-// Install the function signal to be automatically invoked when the timer
-// expires, invoking in its turn the user function alarmHandler
+// Installs alarmHandler as the handler of SIGALRM
 static int installAlarm()
 {
     struct sigaction act = {0};
@@ -127,8 +120,6 @@ static int readFrame(unsigned char a, unsigned char *c, unsigned char *data,
 
     while (state != STOP_ST)
     {
-        // Read one byte from serial port.
-        // NOTE: You must check how many bytes were actually read by reading the return value.
         int r = readByteSerialPort(&byte);
 
         // The alarm was triggered: stop reading so the frame can be retransmitted.
@@ -272,11 +263,6 @@ static int stuffByte(unsigned char *frame, int pos, unsigned char byte)
 ////////////////////////////////////////////////
 int llOpenTx(LinkLayer llParameters)
 {
-    // ----------------------------------------------------
-    // This example code shows how to open the serial port and send a string.
-    // TODO: Adapt and extend this code according to the specifications of the project.
-    // ----------------------------------------------------
-
     if (openSerialPort(llParameters.serialPort, llParameters.baudRate) < 0)
     {
         perror("openSerialPort");
@@ -291,12 +277,7 @@ int llOpenTx(LinkLayer llParameters)
     if (installAlarm() < 0)
         return -1;
 
-    // Create string to send
     unsigned char set[5] = {FLAG, A_TX, C_SET, A_TX ^ C_SET, FLAG}; // BCC = 0x00
-
-    // In non-canonical mode, '\n' does not end the writing.
-    // Test this condition by placing a '\n' in the middle of the buffer.
-    // The whole buffer must be sent even with the '\n'.
 
     // 1 first transmission + up to nRetransmissions retransmissions
     alarmCount = 0;
@@ -340,11 +321,6 @@ int llOpenTx(LinkLayer llParameters)
 
 int llOpenRx(LinkLayer llParameters)
 {
-    // ----------------------------------------------------
-    // This example code shows how to open the serial port and receive a string.
-    // TODO: Adapt and extend this code according to the specifications of the project.
-    // ----------------------------------------------------
-
     if (openSerialPort(llParameters.serialPort, llParameters.baudRate) < 0)
     {
         perror("openSerialPort");
@@ -361,13 +337,7 @@ int llOpenRx(LinkLayer llParameters)
     if (installAlarm() < 0)
         return -1;
 
-    // Read from serial port until a valid SET frame is received.
-
-    // NOTE: This while() cycle is a simple example showing how to read from the serial port.
-    // It must be changed in order to respect the specifications of the protocol indicated in the Lab guide.
-    // -> Replaced by the state machine in readSupervisionFrame().
-    // The receiver does not use the alarm: it waits until a SET arrives.
-
+    // Wait (without timeout) until a valid SET frame arrives
     if (readSupervisionFrame(A_TX, C_SET, FALSE) != FRAME_OK)
     {
         printf("Error reading SET\n");
@@ -382,7 +352,6 @@ int llOpenRx(LinkLayer llParameters)
     printf("%d bytes written to serial port\n", rx_send_bytes);
 
     // The serial port stays open: it is closed in llClose
-
     return 0;
 }
 
